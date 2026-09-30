@@ -40,6 +40,10 @@
  *     For monorepos, run the audit once per workspace package:
  *       node audit.js apps/expo-multi-tv/src --only focus
  *       node audit.js apps/vega/src --only input
+ *   - Vega manifest checks run only when the scanned sources use the API that
+ *     needs the service: useTVEventHandler / TVEventHandler for
+ *     com.amazon.inputd.service, <TextInput> for com.amazon.inputmethod.service.
+ *     TOML comments in manifest.toml are ignored.
  */
 
 const fs = require("node:fs");
@@ -271,6 +275,10 @@ const isTypo = sections.includes("typography");
 
 let missingRoots = 0;
 
+// Which input APIs the scanned sources use; the Vega manifest checks depend on them.
+let usesTVEventHandler = false;
+let usesTextInput = false;
+
 for (const root of roots) {
   if (!fs.existsSync(root)) {
     console.error(`ERROR: scan root not found: ${root}`);
@@ -298,6 +306,10 @@ for (const root of roots) {
     let hasPureBlack = false;
     let firstWhiteLine = null;
     let firstBlackLine = null;
+
+    if (isInput && /\b(useTVEventHandler|TVEventHandler)\b/.test(content)) {
+      usesTVEventHandler = true;
+    }
 
     // Input/Focus check: Vega TV APIs imported from wrong package.
     if ((isInput || isFocus) && projectRuntime === "vega") {
@@ -386,6 +398,7 @@ for (const root of roots) {
 
       // ---------- INPUT ----------
       if (isInput && /<TextInput\b/.test(line)) {
+        usesTextInput = true;
         let element = line;
         const closesOnSameLine = /\/>|>(?!.*<TextInput)/.test(line);
         if (!closesOnSameLine) {
@@ -657,22 +670,47 @@ for (const root of roots) {
 
 // ---- Vega manifest checks ----
 
-if (isInput && projectRuntime === "vega") {
+// Drop TOML comments (`#` to end of line, outside quoted strings), so a service
+// named only in a comment does not count as declared.
+function stripTomlComments(text) {
+  return text
+    .split("\n")
+    .map((line) => {
+      let quote = null;
+      for (let i = 0; i < line.length; i++) {
+        const c = line[i];
+        if (quote) {
+          if (c === "\\" && quote === '"') i++;
+          else if (c === quote) quote = null;
+        } else if (c === '"' || c === "'") {
+          quote = c;
+        } else if (c === "#") {
+          return line.slice(0, i);
+        }
+      }
+      return line;
+    })
+    .join("\n");
+}
+
+function declaresService(manifest, id) {
+  const escaped = id.replace(/\./g, "\\.");
+  return new RegExp(`["']${escaped}["']`).test(manifest);
+}
+
+if (isInput && projectRuntime === "vega" && (usesTVEventHandler || usesTextInput)) {
   // Look for manifest.toml relative to the package.json we found
   const manifestDir = pkgPath ? path.dirname(pkgPath) : roots[0];
   const manifestPath = path.join(manifestDir, "manifest.toml");
-  if (fs.existsSync(manifestPath)) {
-    const manifest = fs.readFileSync(manifestPath, "utf8");
-    if (!/com\.amazon\.inputd\.service/.test(manifest)) {
-      findings.vegaManifestMissingInputd.push({ file: manifestPath });
-    }
-    if (!/com\.amazon\.inputmethod\.service/.test(manifest)) {
-      findings.vegaManifestMissingInputmethod.push({ file: manifestPath });
-    }
-  } else {
-    // No manifest.toml found — both services are implicitly missing
-    findings.vegaManifestMissingInputd.push({ file: manifestDir + "/manifest.toml (not found)" });
-    findings.vegaManifestMissingInputmethod.push({ file: manifestDir + "/manifest.toml (not found)" });
+  const found = fs.existsSync(manifestPath);
+  const manifest = found ? stripTomlComments(fs.readFileSync(manifestPath, "utf8")) : "";
+  // No manifest.toml found — every required service is implicitly missing
+  const file = found ? manifestPath : manifestDir + "/manifest.toml (not found)";
+  if (usesTVEventHandler && !declaresService(manifest, "com.amazon.inputd.service")) {
+    findings.vegaManifestMissingInputd.push({ file });
+  }
+  if (usesTextInput && !declaresService(manifest, "com.amazon.inputmethod.service")) {
+    findings.vegaManifestMissingInputmethod.push({ file });
   }
 }
 
@@ -794,6 +832,8 @@ if (isInput) {
   );
   if (projectRuntime !== "vega") {
     console.log("  not applicable — project is not on Vega");
+  } else if (!usesTVEventHandler) {
+    console.log("  not applicable — no useTVEventHandler / TVEventHandler in the scanned sources");
   } else {
     emitList(findings.vegaManifestMissingInputd, (f) => `  ${f.file}`);
   }
@@ -804,6 +844,8 @@ if (isInput) {
   );
   if (projectRuntime !== "vega") {
     console.log("  not applicable — project is not on Vega");
+  } else if (!usesTextInput) {
+    console.log("  not applicable — no <TextInput> in the scanned sources");
   } else {
     emitList(findings.vegaManifestMissingInputmethod, (f) => `  ${f.file}`);
   }
